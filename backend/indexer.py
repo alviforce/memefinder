@@ -9,6 +9,7 @@ import asyncio
 import base64
 import gc
 import io
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,7 @@ import database as db
 import clip_engine
 import ocr_engine
 import chroma_store
+import vlm_engine
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,46 @@ reocr_state = {
     "started_at": None,
     "elapsed_seconds": 0,
 }
+
+vlm_state = {
+    "status": "idle",   # idle | running | done | error
+    "total": 0,
+    "processed": 0,
+    "updated": 0,
+    "errors": 0,
+    "started_at": None,
+    "elapsed_seconds": 0,
+}
+
+
+def _merge_ocr_with_vlm_text(ocr_text: str, vlm_text: str) -> str:
+    """Append VLM-recognized text to OCR text, skipping if it's a substring."""
+    ocr_text = (ocr_text or "").strip()
+    vlm_text = (vlm_text or "").strip()
+    if not vlm_text:
+        return ocr_text
+    if not ocr_text:
+        return vlm_text
+    if vlm_text.lower() in ocr_text.lower():
+        return ocr_text
+    return f"{ocr_text} {vlm_text}"
+
+
+def _vlm_fields(image_bytes: bytes) -> tuple[str | None, str | None, str | None, str | None]:
+    """
+    Run VLM on a single image. Returns (caption, humor, tags_json, meme_text)
+    — all None when VLM is unavailable or failed.
+    """
+    result = vlm_engine.describe_meme(image_bytes)
+    if not result:
+        return None, None, None, None
+    tags_json = json.dumps(result.get("tags", []), ensure_ascii=False) if result.get("tags") else None
+    return (
+        result.get("caption") or None,
+        result.get("humor") or None,
+        tags_json,
+        result.get("text") or None,
+    )
 
 
 def _generate_thumbnail_base64(image_bytes: bytes) -> str:
@@ -136,10 +178,17 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
             errors += 1
             continue
 
+        # VLM — sequential per image (no batching support in Ollama)
+        caption, humor, tags_json, vlm_text = _vlm_fields(item["image_bytes"])
+        merged_text = _merge_ocr_with_vlm_text(ocr_text, vlm_text or "")
+
         meme_id = db.insert_meme(
             filename=item["filename"],
-            ocr_text=ocr_text,
+            ocr_text=merged_text,
             thumbnail_base64=thumbnail_b64,
+            caption=caption,
+            humor_explain=humor,
+            tags=tags_json,
         )
 
         if meme_id and embedding:
@@ -198,6 +247,147 @@ def _reocr_batch(batch_items: list[dict]) -> tuple[int, int]:
     gc.collect()
     logger.info("Re-OCR batch done: %d updated, %d errors", updated, errors)
     return updated, errors
+
+
+def _vlm_backfill_batch(batch_items: list[dict]) -> tuple[int, int]:
+    """
+    Run VLM for files already in SQLite and fill caption/humor/tags.
+    Also merges VLM-detected text into ocr_text.
+    """
+    if not batch_items:
+        return 0, 0
+
+    updated = 0
+    errors = 0
+    for item in batch_items:
+        try:
+            caption, humor, tags_json, vlm_text = _vlm_fields(item["image_bytes"])
+            if caption is None and humor is None and tags_json is None and not vlm_text:
+                errors += 1
+                continue
+            merged = _merge_ocr_with_vlm_text(item.get("ocr_text", ""), vlm_text or "")
+            ok = db.update_meme_vlm(
+                filename=item["filename"],
+                caption=caption,
+                humor_explain=humor,
+                tags=tags_json,
+                ocr_text=merged if vlm_text else None,
+            )
+            if ok:
+                updated += 1
+            else:
+                errors += 1
+        except Exception as e:
+            logger.warning("VLM backfill failed for %s: %s", item["filename"], e)
+            errors += 1
+
+    gc.collect()
+    logger.info("VLM backfill batch done: %d updated, %d errors", updated, errors)
+    return updated, errors
+
+
+async def run_vlm_backfill():
+    """
+    Fill VLM fields (caption/humor/tags) for every already-indexed meme that
+    has no caption yet. Embeddings and thumbnails are kept as-is.
+    """
+    global vlm_state
+
+    if vlm_state["status"] == "running":
+        logger.warning("VLM backfill already running.")
+        return
+    if indexing_state["status"] == "running" or reocr_state["status"] == "running":
+        logger.warning("Cannot start VLM backfill while indexing/reocr is running.")
+        return
+    if not vlm_engine.is_available():
+        vlm_state.update({
+            "status": "error",
+            "total": 0,
+            "processed": 0,
+            "updated": 0,
+            "errors": 0,
+            "started_at": time.time(),
+            "elapsed_seconds": 0,
+        })
+        logger.error("VLM backfill aborted: Ollama/VLM unavailable.")
+        return
+
+    vlm_state.update({
+        "status": "running",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "errors": 0,
+        "started_at": time.time(),
+        "elapsed_seconds": 0,
+    })
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        missing = db.get_filenames_missing_vlm()
+        valid_ext = {".jpg", ".jpeg", ".png", ".webp"}
+        files_on_disk = {
+            e.name: e for e in MEMES_DIR.iterdir()
+            if e.is_file() and e.suffix.lower() in valid_ext
+        } if MEMES_DIR.exists() else {}
+
+        targets = [files_on_disk[name] for name in missing if name in files_on_disk]
+        vlm_state["total"] = len(targets)
+        logger.info("VLM backfill: %d memes to caption", len(targets))
+
+        batch: list[dict] = []
+        processed_count = 0
+
+        async def _flush():
+            nonlocal processed_count
+            if not batch:
+                return
+            updated, errors = await loop.run_in_executor(
+                _executor, _vlm_backfill_batch, list(batch)
+            )
+            processed_count += len(batch)
+            vlm_state["processed"] = processed_count
+            vlm_state["updated"] += updated
+            vlm_state["errors"] += errors
+            batch.clear()
+            vlm_state["elapsed_seconds"] = time.time() - vlm_state["started_at"]
+
+        for file_path in targets:
+            try:
+                image_bytes = file_path.read_bytes()
+            except Exception as e:
+                logger.error("Cannot read %s: %s", file_path.name, e)
+                vlm_state["errors"] += 1
+                processed_count += 1
+                vlm_state["processed"] = processed_count
+                continue
+
+            existing = db.get_meme_by_filename(file_path.name)
+            batch.append({
+                "filename": file_path.name,
+                "image_bytes": image_bytes,
+                "ocr_text": (existing or {}).get("ocr_text", "") or "",
+            })
+            # VLM is sequential and slow — keep the flush batch small so the
+            # progress counter updates often.
+            if len(batch) >= max(1, BATCH_SIZE // 4):
+                await _flush()
+
+        await _flush()
+
+        vlm_state["status"] = "done"
+        vlm_state["elapsed_seconds"] = time.time() - vlm_state["started_at"]
+        logger.info(
+            "VLM backfill complete: %d processed, %d updated, %d errors, %.1fs",
+            vlm_state["processed"], vlm_state["updated"], vlm_state["errors"],
+            vlm_state["elapsed_seconds"],
+        )
+
+    except Exception as e:
+        logger.error("VLM backfill failed: %s", e, exc_info=True)
+        vlm_state["status"] = "error"
+        vlm_state["elapsed_seconds"] = time.time() - vlm_state["started_at"]
 
 
 async def run_reocr():

@@ -1,12 +1,25 @@
+# Secrets & local env
 .env
-node_modules
-chroma_data
-__pycache__
+.env.local
+*.env
+
+# Local data stores (contain thumbnails / embeddings / user images)
+memes/
+chroma_data/
 memefinder.db
 memefinder.db-shm
 memefinder.db-wal
+data/
+
+# Logs
 *.log
-memes
+
+# Node
+node_modules/
+
+# Python bytecode
+__pycache__/
+*.pyc
 
 # Python virtualenvs
 .venv/
@@ -33,3 +46,11 @@ frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Model caches (if any library writes to project dir)
+models/
+*.pt
+*.pth
+*.onnx
+*.bin
+inference/

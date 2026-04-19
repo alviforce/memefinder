@@ -7,6 +7,7 @@ opencv-python
 paddleocr
 paddlepaddle
 sentence-transformers
+ollama
 chromadb
 pydantic
 pytest

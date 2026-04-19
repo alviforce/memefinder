@@ -33,6 +33,12 @@ OCR_ENGINE = "ensemble"
 # to images before OCR. Improves recall on gradient/shadow/stylized memes.
 PREPROCESS = True
 
+# ── VLM (Vision-Language Model via Ollama) ───────────────────────────────────
+VLM_ENABLED = True
+VLM_MODEL = "huihui_ai/qwen3-abliterated:8b-v2"
+OLLAMA_HOST = "http://localhost:11434"
+VLM_TIMEOUT = 180  # seconds per image — VLM is slow
+
 # ── Батчинг ──────────────────────────────────────────────────────────────────
 BATCH_SIZE = 16
 INDEX_LIMIT = 0  # 0 = no limit

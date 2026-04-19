@@ -29,12 +29,21 @@ def init_db():
             filename         TEXT UNIQUE NOT NULL,
             ocr_text         TEXT,
             thumbnail_base64 TEXT NOT NULL,
+            caption          TEXT,
+            humor_explain    TEXT,
+            tags             TEXT,
             indexed_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_memes_filename ON memes(filename)
     """)
+    # Migrate older DBs (v2.0 schema) — add columns if missing.
+    for col in ("caption", "humor_explain", "tags"):
+        try:
+            conn.execute(f"ALTER TABLE memes ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # already exists
     # FTS5 virtual table — keeps in sync with memes via triggers
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS memes_fts
@@ -64,15 +73,62 @@ def init_db():
     conn.commit()
 
 
-def insert_meme(filename: str, ocr_text: str, thumbnail_base64: str) -> int:
+def insert_meme(
+    filename: str,
+    ocr_text: str,
+    thumbnail_base64: str,
+    caption: str | None = None,
+    humor_explain: str | None = None,
+    tags: str | None = None,
+) -> int:
     """Insert a meme. Returns new row id, or 0 if filename already exists."""
     conn = _get_conn()
     cursor = conn.execute(
-        "INSERT OR IGNORE INTO memes (filename, ocr_text, thumbnail_base64) VALUES (?, ?, ?)",
-        (filename, ocr_text, thumbnail_base64),
+        "INSERT OR IGNORE INTO memes "
+        "(filename, ocr_text, thumbnail_base64, caption, humor_explain, tags) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (filename, ocr_text, thumbnail_base64, caption, humor_explain, tags),
     )
     conn.commit()
     return cursor.lastrowid
+
+
+def update_meme_vlm(
+    filename: str,
+    caption: str | None,
+    humor_explain: str | None,
+    tags: str | None,
+    ocr_text: str | None = None,
+) -> bool:
+    """
+    Update VLM-derived fields for an existing meme. If ocr_text is provided,
+    it replaces the stored OCR text (useful when VLM yields better text).
+    Returns True if a row was updated.
+    """
+    conn = _get_conn()
+    if ocr_text is not None:
+        cursor = conn.execute(
+            "UPDATE memes SET caption = ?, humor_explain = ?, tags = ?, ocr_text = ? "
+            "WHERE filename = ?",
+            (caption, humor_explain, tags, ocr_text, filename),
+        )
+    else:
+        cursor = conn.execute(
+            "UPDATE memes SET caption = ?, humor_explain = ?, tags = ? "
+            "WHERE filename = ?",
+            (caption, humor_explain, tags, filename),
+        )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_filenames_missing_vlm() -> set[str]:
+    """Filenames of memes with no VLM caption yet."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT filename FROM memes WHERE caption IS NULL OR caption = ''"
+    ).fetchall()
+    return {row["filename"] for row in rows}
 
 
 def update_ocr_text(filename: str, ocr_text: str) -> bool:
@@ -121,7 +177,8 @@ def search_by_text(query: str, limit: int = 30, offset: int = 0) -> list[dict]:
     try:
         rows = conn.execute(
             """
-            SELECT m.id, m.filename, m.ocr_text, m.thumbnail_base64
+            SELECT m.id, m.filename, m.ocr_text, m.thumbnail_base64,
+                   m.caption, m.humor_explain, m.tags
             FROM memes_fts f
             JOIN memes m ON m.id = f.rowid
             WHERE memes_fts MATCH ?
@@ -134,7 +191,8 @@ def search_by_text(query: str, limit: int = 30, offset: int = 0) -> list[dict]:
     except sqlite3.OperationalError:
         # Graceful fallback if FTS index is corrupt / query still invalid
         rows = conn.execute(
-            "SELECT id, filename, ocr_text, thumbnail_base64 FROM memes "
+            "SELECT id, filename, ocr_text, thumbnail_base64, "
+            "caption, humor_explain, tags FROM memes "
             "WHERE ocr_text LIKE ? LIMIT ? OFFSET ?",
             (f"%{query}%", limit, offset),
         ).fetchall()
@@ -149,10 +207,13 @@ def _fts_escape(query: str) -> str:
     return " ".join(f'"{t.replace(chr(34), "")}"' for t in tokens)
 
 
+_MEME_COLS = "id, filename, ocr_text, thumbnail_base64, caption, humor_explain, tags, indexed_at"
+
+
 def get_meme_by_id(meme_id: int) -> dict | None:
     conn = _get_conn()
     row = conn.execute(
-        "SELECT id, filename, ocr_text, thumbnail_base64, indexed_at FROM memes WHERE id = ?",
+        f"SELECT {_MEME_COLS} FROM memes WHERE id = ?",
         (meme_id,),
     ).fetchone()
     return dict(row) if row else None
@@ -161,7 +222,7 @@ def get_meme_by_id(meme_id: int) -> dict | None:
 def get_meme_by_filename(filename: str) -> dict | None:
     conn = _get_conn()
     row = conn.execute(
-        "SELECT id, filename, ocr_text, thumbnail_base64, indexed_at FROM memes WHERE filename = ?",
+        f"SELECT {_MEME_COLS} FROM memes WHERE filename = ?",
         (filename,),
     ).fetchone()
     return dict(row) if row else None
@@ -174,8 +235,7 @@ def get_memes_by_filenames(filenames: list[str]) -> dict[str, dict]:
     conn = _get_conn()
     placeholders = ",".join("?" for _ in filenames)
     rows = conn.execute(
-        f"SELECT id, filename, ocr_text, thumbnail_base64, indexed_at "
-        f"FROM memes WHERE filename IN ({placeholders})",
+        f"SELECT {_MEME_COLS} FROM memes WHERE filename IN ({placeholders})",
         filenames,
     ).fetchall()
     return {row["filename"]: dict(row) for row in rows}
@@ -188,7 +248,7 @@ def get_memes_by_ids(meme_ids: list[int]) -> dict[int, dict]:
     conn = _get_conn()
     placeholders = ",".join("?" for _ in meme_ids)
     rows = conn.execute(
-        f"SELECT id, filename, ocr_text, thumbnail_base64 FROM memes WHERE id IN ({placeholders})",
+        f"SELECT {_MEME_COLS} FROM memes WHERE id IN ({placeholders})",
         meme_ids,
     ).fetchall()
     return {row["id"]: dict(row) for row in rows}

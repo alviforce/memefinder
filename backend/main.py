@@ -13,6 +13,7 @@ from config import DEFAULT_SEARCH_LIMIT, MEMES_DIR
 import database as db
 import clip_engine
 import ocr_engine
+import vlm_engine
 import chroma_store
 import indexer
 
@@ -33,6 +34,7 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, clip_engine.load_models)
     await loop.run_in_executor(None, ocr_engine.load_model)
+    await loop.run_in_executor(None, vlm_engine.load_model)
     logger.info("ML models loaded.")
 
     yield
@@ -133,6 +135,24 @@ async def start_indexing():
     return {"message": "Indexing started"}
 
 
+@app.post("/api/index/vlm")
+async def start_vlm_backfill():
+    """
+    Run VLM captioning on every already-indexed meme that has no caption yet.
+    Fills caption/humor_explain/tags and merges any newly-detected text into ocr_text.
+    """
+    if indexer.vlm_state["status"] == "running":
+        return {"message": "VLM backfill already running", **indexer.vlm_state}
+    if indexer.indexing_state["status"] == "running":
+        raise HTTPException(409, "Indexing is running — wait for it to finish")
+    if indexer.reocr_state["status"] == "running":
+        raise HTTPException(409, "Re-OCR is running — wait for it to finish")
+    if not vlm_engine.is_available():
+        raise HTTPException(503, f"VLM unavailable. Check Ollama at {vlm_engine.OLLAMA_HOST} and 'ollama pull {vlm_engine.VLM_MODEL}'")
+    asyncio.create_task(indexer.run_vlm_backfill())
+    return {"message": "VLM backfill started"}
+
+
 @app.post("/api/index/reocr")
 async def start_reocr():
     """
@@ -180,4 +200,5 @@ def get_stats():
         "embedding_count": chroma_store.get_count(),
         "indexing": indexer.indexing_state,
         "reocr": indexer.reocr_state,
+        "vlm": indexer.vlm_state,
     }
