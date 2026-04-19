@@ -5,4 +5,4 @@ __pycache__
 memefinder.db
 memefinder.db-shm
 memefinder.db-wal
-memes
+*.log
