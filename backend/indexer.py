@@ -35,6 +35,16 @@ indexing_state = {
     "elapsed_seconds": 0,
 }
 
+reocr_state = {
+    "status": "idle",   # idle | running | done | error
+    "total": 0,
+    "processed": 0,
+    "updated": 0,
+    "errors": 0,
+    "started_at": None,
+    "elapsed_seconds": 0,
+}
+
 
 def _generate_thumbnail_base64(image_bytes: bytes) -> str:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -153,6 +163,128 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
 
     logger.info("Batch done: %d saved, %d errors", saved, errors)
     return saved, errors
+
+
+def _reocr_batch(batch_items: list[dict]) -> tuple[int, int]:
+    """
+    Re-run OCR for files already present in SQLite and update their ocr_text.
+    Does NOT touch ChromaDB or thumbnails — embeddings don't depend on OCR.
+    Returns (updated_count, error_count).
+    """
+    if not batch_items:
+        return 0, 0
+
+    try:
+        ocr_texts = ocr_engine.extract_texts_batch(
+            [item["image_bytes"] for item in batch_items]
+        )
+    except Exception as e:
+        logger.error("Re-OCR batch failed: %s", e)
+        return 0, len(batch_items)
+
+    updated = 0
+    errors = 0
+    for i, item in enumerate(batch_items):
+        ocr_text = ocr_texts[i] if i < len(ocr_texts) else ""
+        try:
+            if db.update_ocr_text(item["filename"], ocr_text):
+                updated += 1
+            else:
+                errors += 1
+        except Exception as e:
+            logger.warning("DB update failed for %s: %s", item["filename"], e)
+            errors += 1
+
+    gc.collect()
+    logger.info("Re-OCR batch done: %d updated, %d errors", updated, errors)
+    return updated, errors
+
+
+async def run_reocr():
+    """
+    Re-run OCR on every already-indexed meme whose file still exists on disk.
+    Useful after changing OCR_ENGINE / PREPROCESS to refresh stored OCR text
+    without redoing embeddings or thumbnails.
+    """
+    global reocr_state
+
+    if reocr_state["status"] == "running":
+        logger.warning("Re-OCR already running.")
+        return
+    if indexing_state["status"] == "running":
+        logger.warning("Cannot start re-OCR while indexing is running.")
+        return
+
+    reocr_state.update({
+        "status": "running",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "errors": 0,
+        "started_at": time.time(),
+        "elapsed_seconds": 0,
+    })
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        sqlite_filenames = db.get_indexed_filenames()
+        valid_ext = {".jpg", ".jpeg", ".png", ".webp"}
+        files_on_disk = {
+            e.name: e for e in MEMES_DIR.iterdir()
+            if e.is_file() and e.suffix.lower() in valid_ext
+        } if MEMES_DIR.exists() else {}
+
+        # Re-OCR only files present in BOTH SQLite and on disk.
+        targets = [files_on_disk[name] for name in sqlite_filenames if name in files_on_disk]
+        reocr_state["total"] = len(targets)
+        logger.info("Re-OCR: %d files to reprocess", len(targets))
+
+        batch: list[dict] = []
+        processed_count = 0
+
+        async def _flush():
+            nonlocal processed_count
+            if not batch:
+                return
+            updated, errors = await loop.run_in_executor(_executor, _reocr_batch, list(batch))
+            processed_count += len(batch)
+            reocr_state["processed"] = processed_count
+            reocr_state["updated"] += updated
+            reocr_state["errors"] += errors
+            batch.clear()
+            reocr_state["elapsed_seconds"] = time.time() - reocr_state["started_at"]
+
+        for file_path in targets:
+            try:
+                image_bytes = file_path.read_bytes()
+            except Exception as e:
+                logger.error("Cannot read %s: %s", file_path.name, e)
+                reocr_state["errors"] += 1
+                processed_count += 1
+                reocr_state["processed"] = processed_count
+                continue
+
+            batch.append({"filename": file_path.name, "image_bytes": image_bytes})
+            if len(batch) >= BATCH_SIZE:
+                await _flush()
+
+        await _flush()
+
+        reocr_state["status"] = "done"
+        reocr_state["elapsed_seconds"] = time.time() - reocr_state["started_at"]
+        logger.info(
+            "Re-OCR complete: %d processed, %d updated, %d errors, %.1fs",
+            reocr_state["processed"],
+            reocr_state["updated"],
+            reocr_state["errors"],
+            reocr_state["elapsed_seconds"],
+        )
+
+    except Exception as e:
+        logger.error("Re-OCR failed: %s", e, exc_info=True)
+        reocr_state["status"] = "error"
+        reocr_state["elapsed_seconds"] = time.time() - reocr_state["started_at"]
 
 
 async def run_indexing():

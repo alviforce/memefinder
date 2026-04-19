@@ -3,6 +3,9 @@ uvicorn[standard]
 python-dotenv
 Pillow
 easyocr
+opencv-python
+paddleocr
+paddlepaddle
 sentence-transformers
 chromadb
 pydantic

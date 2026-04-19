@@ -75,6 +75,17 @@ def insert_meme(filename: str, ocr_text: str, thumbnail_base64: str) -> int:
     return cursor.lastrowid
 
 
+def update_ocr_text(filename: str, ocr_text: str) -> bool:
+    """Update OCR text for an existing meme. Returns True if a row was updated."""
+    conn = _get_conn()
+    cursor = conn.execute(
+        "UPDATE memes SET ocr_text = ? WHERE filename = ?",
+        (ocr_text, filename),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def delete_meme(filename: str) -> bool:
     """Delete a meme by filename. Returns True if a row was deleted."""
     conn = _get_conn()

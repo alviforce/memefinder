@@ -6,3 +6,30 @@ memefinder.db
 memefinder.db-shm
 memefinder.db-wal
 *.log
+memes
+
+# Python virtualenvs
+.venv/
+venv/
+env/
+
+# Python tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Frontend build output
+frontend/dist/
+.vite/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

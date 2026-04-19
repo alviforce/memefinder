@@ -20,8 +20,18 @@ CLIP_TEXT_MODEL_NAME = "clip-ViT-B-32-multilingual-v1"
 # Images: original CLIP ViT-B/32 — same embedding space as the multilingual text model
 CLIP_IMAGE_MODEL_NAME = "clip-ViT-B-32"
 
-# ── EasyOCR ──────────────────────────────────────────────────────────────────
+# ── OCR ──────────────────────────────────────────────────────────────────────
 OCR_LANGUAGES = ["ru", "en"]
+
+# Which OCR engine to use:
+#   "easyocr"  — original EasyOCR only
+#   "paddle"   — PaddleOCR only (better on stylized meme fonts, ru/en)
+#   "ensemble" — run both and merge results (best recall, slowest)
+OCR_ENGINE = "ensemble"
+
+# Apply CLAHE / unsharp mask / bilateral denoise / adaptive threshold
+# to images before OCR. Improves recall on gradient/shadow/stylized memes.
+PREPROCESS = True
 
 # ── Батчинг ──────────────────────────────────────────────────────────────────
 BATCH_SIZE = 16

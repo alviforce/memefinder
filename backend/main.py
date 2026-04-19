@@ -133,6 +133,20 @@ async def start_indexing():
     return {"message": "Indexing started"}
 
 
+@app.post("/api/index/reocr")
+async def start_reocr():
+    """
+    Re-run OCR on all already-indexed memes. Use after changing OCR_ENGINE
+    or PREPROCESS to refresh stored OCR text. Embeddings/thumbnails are kept.
+    """
+    if indexer.reocr_state["status"] == "running":
+        return {"message": "Re-OCR already running", **indexer.reocr_state}
+    if indexer.indexing_state["status"] == "running":
+        raise HTTPException(409, "Indexing is running — wait for it to finish")
+    asyncio.create_task(indexer.run_reocr())
+    return {"message": "Re-OCR started"}
+
+
 @app.post("/api/index/resync")
 async def resync_stores():
     """
@@ -165,4 +179,5 @@ def get_stats():
         "meme_count": db.get_meme_count(),
         "embedding_count": chroma_store.get_count(),
         "indexing": indexer.indexing_state,
+        "reocr": indexer.reocr_state,
     }
