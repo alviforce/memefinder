@@ -20,6 +20,12 @@ CLIP_TEXT_MODEL_NAME = "clip-ViT-B-32-multilingual-v1"
 # Images: original CLIP ViT-B/32 — same embedding space as the multilingual text model
 CLIP_IMAGE_MODEL_NAME = "clip-ViT-B-32"
 
+# ── Text embeddings (BGE-M3 — Phase 3 hybrid search) ─────────────────────────
+# Multilingual dense text embedder (ru/en, dim=1024) — used for semantic search
+# over OCR + VLM caption + humor + tags. Lives in ChromaDB collection
+# `text_embeddings` next to the existing CLIP image collection.
+TEXT_EMBED_MODEL_NAME = "BAAI/bge-m3"
+
 # ── OCR ──────────────────────────────────────────────────────────────────────
 OCR_LANGUAGES = ["ru", "en"]
 
@@ -35,7 +41,8 @@ PREPROCESS = True
 
 # ── VLM (Vision-Language Model via Ollama) ───────────────────────────────────
 VLM_ENABLED = True
-VLM_MODEL = "huihui_ai/qwen3-abliterated:8b-v2"
+# Phase 3: switched to the Qwen3-VL instruct model (better at meme captions)
+VLM_MODEL = "huihui_ai/qwen3-vl-abliterated:8b-instruct"
 OLLAMA_HOST = "http://localhost:11434"
 VLM_TIMEOUT = 180  # seconds per image — VLM is slow
 
@@ -49,6 +56,21 @@ THUMBNAIL_QUALITY = 60
 
 # ── API ──────────────────────────────────────────────────────────────────────
 DEFAULT_SEARCH_LIMIT = 30
+
+# ── Hybrid search (Phase 3) ──────────────────────────────────────────────────
+# Toggle individual retrievers for the hybrid endpoint. Useful for benchmarking.
+SEARCH_USE_FTS = True            # SQLite FTS5 keyword search over OCR text
+SEARCH_USE_TEXT_VECTOR = True    # BGE-M3 dense semantic search
+SEARCH_USE_IMAGE_VECTOR = True   # CLIP image-space search (text→image and image→image)
+
+# Reciprocal Rank Fusion constants. Higher k1 dampens top-rank dominance,
+# higher k2 makes the rank-decay steeper. See search_service.reciprocal_rank_fusion.
+RRF_K1 = 60.0
+RRF_K2 = 20.0
+
+# Per-retriever candidate pool size before fusion. Bigger = more recall, slower.
+RETRIEVER_TOP_K = 60
+IMAGE_RETRIEVER_TOP_K = 40
 
 # ── Устройство ───────────────────────────────────────────────────────────────
 import torch

@@ -238,6 +238,7 @@ a {
   width: 100%;
   padding: var(--space-md) var(--space-lg);
   padding-left: 56px;
+  padding-right: 110px;
   font-size: var(--font-size-lg);
   color: var(--text-primary);
   background: var(--bg-input);
@@ -888,4 +889,135 @@ a {
   width: 40px;
   height: 40px;
   border-width: 4px;
+}
+
+/* ── Phase 3: hybrid search additions ──────────────────────────────────── */
+
+/* Image-upload button inside the search input */
+.search-image-btn,
+.search-image-clear {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.search-image-btn:hover,
+.search-image-clear:hover {
+  border-color: var(--border-glow);
+  color: var(--text-primary);
+  background: var(--accent-glow);
+}
+
+.search-image-btn.active {
+  background: var(--accent-glow);
+  border-color: var(--border-glow);
+  color: var(--text-primary);
+}
+
+.search-image-clear {
+  right: 56px;
+  font-size: 14px;
+}
+
+.search-image-preview {
+  margin-top: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--accent-glow);
+  border: 1px solid var(--border-glow);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+/* Caption + tags on the meme card hover overlay */
+.meme-card-caption {
+  font-size: var(--font-size-xs);
+  color: var(--text-primary);
+  font-weight: 500;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: var(--space-sm);
+  line-height: 1.35;
+}
+
+.meme-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: var(--space-sm);
+}
+
+.meme-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+/* Modal metadata blocks */
+.modal-meta-block {
+  margin-top: var(--space-md);
+  padding: var(--space-md);
+  background: var(--bg-glass);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+}
+
+.modal-meta-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.modal-meta-value {
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.modal-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Results header — timing + retrievers info */
+.results-timing {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  margin-left: 4px;
+}
+
+.results-retrievers {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-style: italic;
+}
+
+/* Three-mode toggle: shrink each button so all three fit on smaller screens */
+.mode-toggle .mode-toggle-btn {
+  flex: 1 1 0;
+  min-width: 0;
 }

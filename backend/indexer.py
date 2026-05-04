@@ -1,7 +1,7 @@
 """
 MemeFinder — Local Folder Indexer
 Reads photos from the 'memes' folder, generates thumbnails,
-runs OCR + CLIP in batches, stores results in SQLite + ChromaDB.
+runs OCR + VLM + CLIP + BGE-M3 in batches, stores results in SQLite + ChromaDB.
 
 _process_batch runs in a thread pool so it never blocks the async event loop.
 """
@@ -21,6 +21,7 @@ import database as db
 import clip_engine
 import ocr_engine
 import chroma_store
+import text_embedder
 import vlm_engine
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,33 @@ vlm_state = {
     "elapsed_seconds": 0,
 }
 
+text_embed_state = {
+    "status": "idle",   # idle | running | done | error
+    "total": 0,
+    "processed": 0,
+    "updated": 0,
+    "errors": 0,
+    "started_at": None,
+    "elapsed_seconds": 0,
+}
+
+straggler_state = {
+    "status": "idle",   # idle | running | done | error
+    "total": 0,
+    "processed": 0,
+    "updated": 0,        # успешно описаны компактным промптом
+    "marked_skipped": 0, # помечены '[авто: не удалось распознать]' после фейла
+    "errors": 0,
+    "started_at": None,
+    "elapsed_seconds": 0,
+}
+
+# Sentinel caption written when even the compact prompt fails — keeps the meme
+# out of future stragglers queues but is recognizable in search results.
+SKIPPED_CAPTION_SENTINEL = "[авто: не удалось распознать]"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _merge_ocr_with_vlm_text(ocr_text: str, vlm_text: str) -> str:
     """Append VLM-recognized text to OCR text, skipping if it's a substring."""
@@ -71,12 +99,15 @@ def _merge_ocr_with_vlm_text(ocr_text: str, vlm_text: str) -> str:
     return f"{ocr_text} {vlm_text}"
 
 
-def _vlm_fields(image_bytes: bytes) -> tuple[str | None, str | None, str | None, str | None]:
+def _vlm_fields(
+    image_bytes: bytes, filename: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None]:
     """
     Run VLM on a single image. Returns (caption, humor, tags_json, meme_text)
-    — all None when VLM is unavailable or failed.
+    — all None when VLM is unavailable or failed. `filename` is only used to
+    enrich VLM logs with file context.
     """
-    result = vlm_engine.describe_meme(image_bytes)
+    result = vlm_engine.describe_meme(image_bytes, filename=filename)
     if not result:
         return None, None, None, None
     tags_json = json.dumps(result.get("tags", []), ensure_ascii=False) if result.get("tags") else None
@@ -97,10 +128,32 @@ def _generate_thumbnail_base64(image_bytes: bytes) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+def _embed_texts_for_filenames(filenames: list[str], text_blobs: list[str]) -> int:
+    """
+    Encode `text_blobs` with BGE-M3 and upsert into ChromaDB text_embeddings.
+    Returns number of vectors actually stored (skips empty blobs).
+    """
+    pairs = [(fn, txt) for fn, txt in zip(filenames, text_blobs) if txt and txt.strip()]
+    if not pairs:
+        return 0
+    fns, blobs = zip(*pairs)
+    embeddings = text_embedder.encode(list(blobs))
+    chroma_store.add_text_embeddings_batch(
+        ids=list(fns),
+        embeddings=embeddings,
+        metadatas=[{"filename": fn} for fn in fns],
+    )
+    return sum(1 for e in embeddings if e)
+
+
+# ── Per-batch workers (run in thread pool) ───────────────────────────────────
+
 def _embed_only_batch(batch_items: list[dict]) -> tuple[int, int]:
     """
-    Fast path for files already in SQLite but missing ChromaDB embeddings.
+    Fast path for files already in SQLite but missing ChromaDB image embeddings.
     Skips OCR and thumbnail — only encodes images and upserts to ChromaDB.
+    Also (re)generates the BGE text embedding from existing SQLite metadata,
+    so resync covers both vector stores in one go.
     Returns (saved_count, error_count).
     """
     if not batch_items:
@@ -130,10 +183,19 @@ def _embed_only_batch(batch_items: list[dict]) -> tuple[int, int]:
 
     if chroma_ids:
         try:
-            chroma_store.add_embeddings_batch(chroma_ids, chroma_embeddings, chroma_metadatas)
+            chroma_store.add_image_embeddings_batch(chroma_ids, chroma_embeddings, chroma_metadatas)
         except Exception as e:
             logger.error("ChromaDB upsert failed: %s", e)
             errors += len(chroma_ids)
+
+    # Also backfill text embeddings for these rows.
+    text_blobs = [item.get("text_for_embedding", "") for item in batch_items]
+    try:
+        _embed_texts_for_filenames(
+            [item["filename"] for item in batch_items], text_blobs,
+        )
+    except Exception as e:
+        logger.error("Text embedding backfill failed in embed-only batch: %s", e)
 
     del pil_images
     gc.collect()
@@ -145,7 +207,7 @@ def _embed_only_batch(batch_items: list[dict]) -> tuple[int, int]:
 
 def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
     """
-    Synchronous heavy work: CLIP encode + OCR + persist.
+    Synchronous heavy work: CLIP encode + OCR + VLM + persist + BGE text embed.
     Returns (saved_count, error_count).
     Runs in a thread pool — never call directly from async code.
     """
@@ -166,6 +228,8 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
     saved = 0
     errors = 0
     chroma_ids, chroma_embeddings, chroma_metadatas = [], [], []
+    text_blob_filenames: list[str] = []
+    text_blobs: list[str] = []
 
     for i, item in enumerate(batch_items):
         ocr_text = ocr_texts[i] if i < len(ocr_texts) else ""
@@ -181,6 +245,9 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
         # VLM — sequential per image (no batching support in Ollama)
         caption, humor, tags_json, vlm_text = _vlm_fields(item["image_bytes"])
         merged_text = _merge_ocr_with_vlm_text(ocr_text, vlm_text or "")
+        text_for_embedding = db.build_text_for_embedding(
+            merged_text, caption, humor, tags_json,
+        )
 
         meme_id = db.insert_meme(
             filename=item["filename"],
@@ -189,6 +256,7 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
             caption=caption,
             humor_explain=humor,
             tags=tags_json,
+            text_for_embedding=text_for_embedding,
         )
 
         if meme_id and embedding:
@@ -198,14 +266,25 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
         elif meme_id and not embedding:
             logger.warning("No embedding for %s — will be missing from CLIP search", item["filename"])
 
+        if meme_id and text_for_embedding:
+            text_blob_filenames.append(item["filename"])
+            text_blobs.append(text_for_embedding)
+
         saved += 1
 
     if chroma_ids:
         try:
-            chroma_store.add_embeddings_batch(chroma_ids, chroma_embeddings, chroma_metadatas)
+            chroma_store.add_image_embeddings_batch(chroma_ids, chroma_embeddings, chroma_metadatas)
         except Exception as e:
-            logger.error("ChromaDB upsert failed for batch: %s", e)
+            logger.error("ChromaDB image upsert failed for batch: %s", e)
             errors += len(chroma_ids)
+
+    if text_blob_filenames:
+        try:
+            _embed_texts_for_filenames(text_blob_filenames, text_blobs)
+        except Exception as e:
+            logger.error("BGE text embedding upsert failed for batch: %s", e)
+            # Don't bump errors — image-side persist still succeeded.
 
     del pil_images
     gc.collect()
@@ -217,8 +296,8 @@ def _process_batch(batch_items: list[dict]) -> tuple[int, int]:
 def _reocr_batch(batch_items: list[dict]) -> tuple[int, int]:
     """
     Re-run OCR for files already present in SQLite and update their ocr_text.
-    Does NOT touch ChromaDB or thumbnails — embeddings don't depend on OCR.
-    Returns (updated_count, error_count).
+    Refreshes text_for_embedding via db.update_ocr_text and re-embeds with BGE.
+    Image embeddings/thumbnails are kept untouched.
     """
     if not batch_items:
         return 0, 0
@@ -233,16 +312,28 @@ def _reocr_batch(batch_items: list[dict]) -> tuple[int, int]:
 
     updated = 0
     errors = 0
+    text_blob_filenames: list[str] = []
+    text_blobs: list[str] = []
     for i, item in enumerate(batch_items):
         ocr_text = ocr_texts[i] if i < len(ocr_texts) else ""
         try:
             if db.update_ocr_text(item["filename"], ocr_text):
                 updated += 1
+                refreshed = db.get_meme_by_filename(item["filename"])
+                if refreshed and refreshed.get("text_for_embedding"):
+                    text_blob_filenames.append(item["filename"])
+                    text_blobs.append(refreshed["text_for_embedding"])
             else:
                 errors += 1
         except Exception as e:
             logger.warning("DB update failed for %s: %s", item["filename"], e)
             errors += 1
+
+    if text_blob_filenames:
+        try:
+            _embed_texts_for_filenames(text_blob_filenames, text_blobs)
+        except Exception as e:
+            logger.error("Re-OCR BGE re-embed failed: %s", e)
 
     gc.collect()
     logger.info("Re-OCR batch done: %d updated, %d errors", updated, errors)
@@ -252,22 +343,31 @@ def _reocr_batch(batch_items: list[dict]) -> tuple[int, int]:
 def _vlm_backfill_batch(batch_items: list[dict]) -> tuple[int, int]:
     """
     Run VLM for files already in SQLite and fill caption/humor/tags.
-    Also merges VLM-detected text into ocr_text.
+    Also merges VLM-detected text into ocr_text and refreshes the BGE embedding.
     """
     if not batch_items:
         return 0, 0
 
     updated = 0
     errors = 0
+    text_blob_filenames: list[str] = []
+    text_blobs: list[str] = []
     for item in batch_items:
+        fname = item["filename"]
         try:
-            caption, humor, tags_json, vlm_text = _vlm_fields(item["image_bytes"])
+            caption, humor, tags_json, vlm_text = _vlm_fields(
+                item["image_bytes"], filename=fname,
+            )
             if caption is None and humor is None and tags_json is None and not vlm_text:
+                logger.warning(
+                    "VLM backfill[%s]: VLM returned no usable fields — counted as error.",
+                    fname,
+                )
                 errors += 1
                 continue
             merged = _merge_ocr_with_vlm_text(item.get("ocr_text", ""), vlm_text or "")
             ok = db.update_meme_vlm(
-                filename=item["filename"],
+                filename=fname,
                 caption=caption,
                 humor_explain=humor,
                 tags=tags_json,
@@ -275,48 +375,271 @@ def _vlm_backfill_batch(batch_items: list[dict]) -> tuple[int, int]:
             )
             if ok:
                 updated += 1
+                refreshed = db.get_meme_by_filename(fname)
+                if refreshed and refreshed.get("text_for_embedding"):
+                    text_blob_filenames.append(fname)
+                    text_blobs.append(refreshed["text_for_embedding"])
             else:
+                logger.warning(
+                    "VLM backfill[%s]: db.update_meme_vlm returned False "
+                    "(row not found or unchanged) — counted as error.",
+                    fname,
+                )
                 errors += 1
         except Exception as e:
-            logger.warning("VLM backfill failed for %s: %s", item["filename"], e)
+            logger.warning(
+                "VLM backfill[%s] crashed: %s", fname, e, exc_info=True,
+            )
             errors += 1
+
+    if text_blob_filenames:
+        try:
+            _embed_texts_for_filenames(text_blob_filenames, text_blobs)
+        except Exception as e:
+            logger.error("VLM backfill BGE re-embed failed: %s", e)
 
     gc.collect()
     logger.info("VLM backfill batch done: %d updated, %d errors", updated, errors)
     return updated, errors
 
 
-async def run_vlm_backfill():
+def _vlm_straggler_batch(batch_items: list[dict]) -> tuple[int, int, int]:
     """
-    Fill VLM fields (caption/humor/tags) for every already-indexed meme that
-    has no caption yet. Embeddings and thumbnails are kept as-is.
+    Last-resort pass for memes the standard VLM prompt couldn't caption:
+    - tries `describe_meme_compact` (shorter prompt, num_predict=3072, temperature=0)
+    - on success → writes caption + text via update_meme_vlm and re-embeds with BGE
+    - on failure → writes SKIPPED_CAPTION_SENTINEL so the meme drops out of
+      `caption IS NULL OR caption=''` filters and won't be re-tried forever.
+    Returns (rescued, marked_skipped, errors).
     """
-    global vlm_state
+    if not batch_items:
+        return 0, 0, 0
 
-    if vlm_state["status"] == "running":
-        logger.warning("VLM backfill already running.")
+    rescued = 0
+    marked = 0
+    errors = 0
+    text_blob_filenames: list[str] = []
+    text_blobs: list[str] = []
+
+    for item in batch_items:
+        fname = item["filename"]
+        try:
+            try:
+                result = vlm_engine.describe_meme_compact(
+                    item["image_bytes"], filename=fname,
+                )
+            except vlm_engine.VLMServiceUnavailable as e:
+                # Single-meme timeout / 500 / connection blip. Skip this item
+                # WITHOUT writing a sentinel (caption stays NULL → next
+                # /vlm/stragglers run will pick it up again). Re-raise so the
+                # outer except increments `errors` and we move to the next item.
+                logger.warning(
+                    "Straggler[%s]: Ollama transient failure (%s) — left as NULL, "
+                    "will retry on next /vlm/stragglers run.",
+                    fname, e,
+                )
+                raise
+            if result and (result.get("caption") or result.get("text")):
+                vlm_text = result.get("text") or ""
+                merged = _merge_ocr_with_vlm_text(item.get("ocr_text", ""), vlm_text)
+                ok = db.update_meme_vlm(
+                    filename=fname,
+                    caption=result.get("caption") or None,
+                    humor_explain=None,
+                    tags=None,
+                    ocr_text=merged if vlm_text else None,
+                )
+                if ok:
+                    rescued += 1
+                    refreshed = db.get_meme_by_filename(fname)
+                    if refreshed and refreshed.get("text_for_embedding"):
+                        text_blob_filenames.append(fname)
+                        text_blobs.append(refreshed["text_for_embedding"])
+                else:
+                    logger.warning(
+                        "VLM straggler[%s]: db.update_meme_vlm returned False",
+                        fname,
+                    )
+                    errors += 1
+                continue
+
+            # Compact prompt also failed → mark as skipped so we don't loop on it
+            ok = db.update_meme_vlm(
+                filename=fname,
+                caption=SKIPPED_CAPTION_SENTINEL,
+                humor_explain=None,
+                tags=None,
+                ocr_text=None,
+            )
+            if ok:
+                marked += 1
+                logger.warning(
+                    "VLM straggler[%s]: marked as '%s' — both prompts failed.",
+                    fname, SKIPPED_CAPTION_SENTINEL,
+                )
+                refreshed = db.get_meme_by_filename(fname)
+                if refreshed and refreshed.get("text_for_embedding"):
+                    text_blob_filenames.append(fname)
+                    text_blobs.append(refreshed["text_for_embedding"])
+            else:
+                errors += 1
+        except Exception as e:
+            logger.warning("VLM straggler[%s] crashed: %s", fname, e, exc_info=True)
+            errors += 1
+
+    if text_blob_filenames:
+        try:
+            _embed_texts_for_filenames(text_blob_filenames, text_blobs)
+        except Exception as e:
+            logger.error("Straggler BGE re-embed failed: %s", e)
+
+    gc.collect()
+    logger.info(
+        "Straggler batch done: %d rescued, %d marked-skipped, %d errors",
+        rescued, marked, errors,
+    )
+    return rescued, marked, errors
+
+
+def _text_embed_backfill_batch(batch_items: list[dict]) -> tuple[int, int]:
+    """
+    Generate / refresh BGE text embeddings for already-indexed memes.
+    Each batch item has {filename, text_for_embedding}.
+    """
+    if not batch_items:
+        return 0, 0
+    filenames = [it["filename"] for it in batch_items]
+    blobs = [it.get("text_for_embedding") or "" for it in batch_items]
+    try:
+        n = _embed_texts_for_filenames(filenames, blobs)
+    except Exception as e:
+        logger.error("Text-embed backfill batch failed: %s", e)
+        return 0, len(batch_items)
+    return n, len(batch_items) - n
+
+
+# ── Top-level orchestration ──────────────────────────────────────────────────
+
+async def run_text_embed_backfill():
+    """
+    (Re)compute BGE text embeddings for every meme that has a populated
+    text_for_embedding but is missing from the Chroma `text_embeddings`
+    collection. Safe to run repeatedly — upsert by filename.
+    """
+    global text_embed_state
+
+    if text_embed_state["status"] == "running":
+        logger.warning("Text-embed backfill already running.")
         return
-    if indexing_state["status"] == "running" or reocr_state["status"] == "running":
-        logger.warning("Cannot start VLM backfill while indexing/reocr is running.")
-        return
-    if not vlm_engine.is_available():
-        vlm_state.update({
-            "status": "error",
-            "total": 0,
-            "processed": 0,
-            "updated": 0,
-            "errors": 0,
-            "started_at": time.time(),
-            "elapsed_seconds": 0,
-        })
-        logger.error("VLM backfill aborted: Ollama/VLM unavailable.")
+    if indexing_state["status"] == "running":
+        logger.warning("Cannot start text-embed backfill while indexing is running.")
         return
 
-    vlm_state.update({
+    text_embed_state.update({
         "status": "running",
         "total": 0,
         "processed": 0,
         "updated": 0,
+        "errors": 0,
+        "started_at": time.time(),
+        "elapsed_seconds": 0,
+    })
+    loop = asyncio.get_event_loop()
+
+    try:
+        rows = db.get_text_for_embedding_rows()
+        existing = chroma_store.get_text_filenames()
+        # Backfill rows that either have no text_for_embedding stored yet or
+        # are missing from the Chroma text collection. We rebuild the canonical
+        # text on the fly so the migration is self-healing.
+        targets: list[dict] = []
+        for r in rows:
+            text = (r.get("text_for_embedding") or "").strip()
+            if not text:
+                text = db.build_text_for_embedding(
+                    r.get("ocr_text"), r.get("caption"),
+                    r.get("humor_explain"), r.get("tags"),
+                )
+                if text:
+                    db.update_text_for_embedding(r["filename"], text)
+            if not text:
+                continue
+            if r["filename"] not in existing:
+                targets.append({"filename": r["filename"], "text_for_embedding": text})
+        text_embed_state["total"] = len(targets)
+        logger.info("Text-embed backfill: %d memes to embed", len(targets))
+
+        batch: list[dict] = []
+        processed_count = 0
+
+        async def _flush():
+            nonlocal processed_count
+            if not batch:
+                return
+            updated, errors = await loop.run_in_executor(
+                _executor, _text_embed_backfill_batch, list(batch),
+            )
+            processed_count += len(batch)
+            text_embed_state["processed"] = processed_count
+            text_embed_state["updated"] += updated
+            text_embed_state["errors"] += errors
+            batch.clear()
+            text_embed_state["elapsed_seconds"] = (
+                time.time() - text_embed_state["started_at"]
+            )
+
+        for t in targets:
+            batch.append(t)
+            if len(batch) >= BATCH_SIZE:
+                await _flush()
+        await _flush()
+
+        text_embed_state["status"] = "done"
+        text_embed_state["elapsed_seconds"] = (
+            time.time() - text_embed_state["started_at"]
+        )
+        logger.info(
+            "Text-embed backfill complete: %d processed, %d updated, %d errors, %.1fs",
+            text_embed_state["processed"], text_embed_state["updated"],
+            text_embed_state["errors"], text_embed_state["elapsed_seconds"],
+        )
+    except Exception as e:
+        logger.error("Text-embed backfill failed: %s", e, exc_info=True)
+        text_embed_state["status"] = "error"
+        text_embed_state["elapsed_seconds"] = (
+            time.time() - text_embed_state["started_at"]
+        )
+
+
+async def run_vlm_stragglers():
+    """
+    Last-resort pass over memes whose caption is still NULL or empty (or that
+    were marked with SKIPPED_CAPTION_SENTINEL on a previous run if the user
+    re-runs after fixing the model).
+
+    Uses the compact VLM prompt (text + caption only, num_predict=3072,
+    temperature=0). On compact-prompt failure the meme is stamped with
+    SKIPPED_CAPTION_SENTINEL so it stops appearing in the queue.
+    """
+    global straggler_state
+
+    if straggler_state["status"] == "running":
+        logger.warning("Straggler backfill already running.")
+        return
+    if (
+        indexing_state["status"] == "running"
+        or vlm_state["status"] == "running"
+        or reocr_state["status"] == "running"
+    ):
+        logger.warning("Cannot start straggler backfill while another job is running.")
+        return
+
+    straggler_state.update({
+        "status": "running",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "marked_skipped": 0,
         "errors": 0,
         "started_at": time.time(),
         "elapsed_seconds": 0,
@@ -333,6 +656,144 @@ async def run_vlm_backfill():
         } if MEMES_DIR.exists() else {}
 
         targets = [files_on_disk[name] for name in missing if name in files_on_disk]
+        straggler_state["total"] = len(targets)
+        logger.info("Straggler backfill: %d memes without caption", len(targets))
+
+        batch: list[dict] = []
+        processed_count = 0
+
+        async def _flush():
+            nonlocal processed_count
+            if not batch:
+                return
+            rescued, marked, errors = await loop.run_in_executor(
+                _executor, _vlm_straggler_batch, list(batch),
+            )
+            # Note: if the worker raised VLMServiceUnavailable, the await above
+            # re-raises it here and we exit through the outer except block —
+            # NO sentinel writes happen for the rest of the queue.
+            processed_count += len(batch)
+            straggler_state["processed"] = processed_count
+            straggler_state["updated"] += rescued
+            straggler_state["marked_skipped"] += marked
+            straggler_state["errors"] += errors
+            batch.clear()
+            straggler_state["elapsed_seconds"] = (
+                time.time() - straggler_state["started_at"]
+            )
+
+        for file_path in targets:
+            try:
+                image_bytes = file_path.read_bytes()
+            except Exception as e:
+                logger.error("Cannot read %s: %s", file_path.name, e)
+                straggler_state["errors"] += 1
+                processed_count += 1
+                straggler_state["processed"] = processed_count
+                continue
+
+            existing = db.get_meme_by_filename(file_path.name)
+            batch.append({
+                "filename": file_path.name,
+                "image_bytes": image_bytes,
+                "ocr_text": (existing or {}).get("ocr_text", "") or "",
+            })
+            # Compact prompt is heavy (num_predict=3072) — flush often for visible
+            # progress in /api/stats while a tiny queue runs.
+            if len(batch) >= max(1, BATCH_SIZE // 4):
+                await _flush()
+
+        await _flush()
+
+        straggler_state["status"] = "done"
+        straggler_state["elapsed_seconds"] = (
+            time.time() - straggler_state["started_at"]
+        )
+        logger.info(
+            "Straggler backfill complete: %d processed, %d rescued, "
+            "%d marked-skipped, %d errors, %.1fs",
+            straggler_state["processed"], straggler_state["updated"],
+            straggler_state["marked_skipped"], straggler_state["errors"],
+            straggler_state["elapsed_seconds"],
+        )
+
+    except vlm_engine.VLMServiceUnavailable as e:
+        logger.error(
+            "Straggler backfill aborted: Ollama unavailable. "
+            "%d already processed (%d rescued, %d marked-skipped). "
+            "Restart Ollama and POST /api/index/vlm/stragglers again to retry. "
+            "Original error: %s",
+            straggler_state["processed"], straggler_state["updated"],
+            straggler_state["marked_skipped"], e,
+        )
+        straggler_state["status"] = "error"
+        straggler_state["elapsed_seconds"] = (
+            time.time() - straggler_state["started_at"]
+        )
+    except Exception as e:
+        logger.error("Straggler backfill failed: %s", e, exc_info=True)
+        straggler_state["status"] = "error"
+        straggler_state["elapsed_seconds"] = (
+            time.time() - straggler_state["started_at"]
+        )
+
+
+async def run_vlm_backfill(force: bool = False):
+    """
+    Fill VLM fields (caption/humor/tags) for every already-indexed meme that
+    has no caption yet. Embeddings and thumbnails are kept as-is.
+    """
+    global vlm_state
+
+    if vlm_state["status"] == "running":
+        logger.warning("VLM backfill already running.")
+        return
+    if indexing_state["status"] == "running" or reocr_state["status"] == "running":
+        logger.warning("Cannot start VLM backfill while indexing/reocr is running.")
+        return
+    '''
+    if not vlm_engine.is_available():
+        vlm_state.update({
+            "status": "error",
+            "total": 0,
+            "processed": 0,
+            "updated": 0,
+            "errors": 0,
+            "started_at": time.time(),
+            "elapsed_seconds": 0,
+        })
+        logger.error("VLM backfill aborted: Ollama/VLM unavailable.")
+        return
+    '''
+
+    vlm_state.update({
+        "status": "running",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "errors": 0,
+        "started_at": time.time(),
+        "elapsed_seconds": 0,
+    })
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        valid_ext = {".jpg", ".jpeg", ".png", ".webp"}
+        files_on_disk = {
+            e.name: e for e in MEMES_DIR.iterdir()
+            if e.is_file() and e.suffix.lower() in valid_ext
+        } if MEMES_DIR.exists() else {}
+
+        if force:
+            targets = list(files_on_disk.values())
+        else:
+            missing = db.get_filenames_missing_vlm()
+            targets = [files_on_disk[name] for name in missing if name in files_on_disk]
+        
+        if force:
+            logger.info("VLM backfill: FORCE mode enabled — reprocessing all %d indexed memes", len(targets))
+
         vlm_state["total"] = len(targets)
         logger.info("VLM backfill: %d memes to caption", len(targets))
 
@@ -498,10 +959,11 @@ async def run_indexing():
 
     try:
         sqlite_filenames = db.get_indexed_filenames()
-        chroma_filenames = chroma_store.get_indexed_filenames()
+        chroma_image_filenames = chroma_store.get_image_filenames()
+        chroma_text_filenames = chroma_store.get_text_filenames()
         logger.info(
-            "Already indexed: %d in SQLite, %d in ChromaDB",
-            len(sqlite_filenames), len(chroma_filenames),
+            "Already indexed: %d in SQLite, %d image embeddings, %d text embeddings",
+            len(sqlite_filenames), len(chroma_image_filenames), len(chroma_text_filenames),
         )
 
         valid_ext = {".jpg", ".jpeg", ".png", ".webp"}
@@ -514,8 +976,8 @@ async def run_indexing():
         logger.info("Found %d image files to process", len(files_to_process))
 
         # Three queues:
-        #   full_batch  — new files: need OCR + thumbnail + embedding
-        #   embed_batch — in SQLite but missing ChromaDB embedding (embed-only)
+        #   full_batch  — new files: need OCR + thumbnail + embedding + VLM
+        #   embed_batch — in SQLite but missing image embedding (embed-only)
         full_batch: list[dict] = []
         embed_batch: list[dict] = []
         processed_count = 0
@@ -551,9 +1013,10 @@ async def run_indexing():
             filename = file_path.name
 
             in_sqlite = filename in sqlite_filenames
-            in_chroma = filename in chroma_filenames
+            in_image = filename in chroma_image_filenames
+            in_text = filename in chroma_text_filenames
 
-            if in_sqlite and in_chroma:
+            if in_sqlite and in_image and in_text:
                 # Fully indexed — skip
                 processed_count += 1
                 indexing_state["processed"] = processed_count
@@ -566,9 +1029,23 @@ async def run_indexing():
                 indexing_state["errors"] += 1
                 continue
 
-            if in_sqlite and not in_chroma:
-                # Has OCR/thumbnail but missing embedding — fast path
-                embed_batch.append({"filename": filename, "image_bytes": image_bytes})
+            if in_sqlite and (not in_image or not in_text):
+                # Has OCR/thumbnail but missing one of the embeddings — fast path
+                existing = db.get_meme_by_filename(filename) or {}
+                # Ensure text_for_embedding exists; recompute if not.
+                text_blob = (existing.get("text_for_embedding") or "").strip()
+                if not text_blob:
+                    text_blob = db.build_text_for_embedding(
+                        existing.get("ocr_text"), existing.get("caption"),
+                        existing.get("humor_explain"), existing.get("tags"),
+                    )
+                    if text_blob:
+                        db.update_text_for_embedding(filename, text_blob)
+                embed_batch.append({
+                    "filename": filename,
+                    "image_bytes": image_bytes,
+                    "text_for_embedding": text_blob,
+                })
                 if len(embed_batch) >= BATCH_SIZE:
                     await _flush_embed()
             else:

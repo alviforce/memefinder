@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+python-multipart        # multipart/form-data for POST /api/search image uploads
 python-dotenv
 Pillow
 easyocr
@@ -10,6 +11,9 @@ sentence-transformers
 ollama
 chromadb
 pydantic
+# BGE-M3 (Phase 3) is loaded through sentence-transformers; einops is needed
+# by the BGE codebase for tensor reshapes during inference.
+einops
 pytest
 pytest-asyncio
 httpx
