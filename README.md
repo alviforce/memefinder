@@ -1,23 +1,23 @@
 # MemeFinder
 
-Локальная поисковая система по мемам. Индексирует папку `memes/` и ищет нужный
-мем по тексту, по смыслу или по картинке — всё локально, без облаков.
+A local meme search engine. Indexes a `memes/` folder and finds the right
+meme by text, by meaning, or by image — all running locally, no external APIs.
 
-Поиск гибридный: один запрос проходит через три ретривера одновременно
-(SQLite FTS5 keyword, BGE-M3 семантика, CLIP визуал) и результаты сливаются
-через **Reciprocal Rank Fusion** в одну ранжированную выдачу.
+Search is hybrid: every query is dispatched to three retrievers in parallel
+(SQLite FTS5 keyword, BGE-M3 semantic, CLIP visual) and the result lists are
+merged through **Reciprocal Rank Fusion** into a single ranked feed.
 
-## Возможности
+## Features
 
-- 🌟 **Гибридный поиск** — FTS5 + BGE-M3 + CLIP, объединённые через RRF.
-- 📝 **OCR** через EasyOCR + PaddleOCR в ансамбле, с CLAHE-препроцессингом
-  под шакальные мемные шрифты.
-- 🤖 **VLM-описания** через Ollama (`qwen3-vl-abliterated:8b-instruct`) —
-  caption, объяснение шутки, теги.
-- 🧠 **CLIP** для поиска по смыслу и по загруженной картинке.
-- 📚 **BGE-M3** (multilingual, dim=1024) для семантики над OCR + VLM-полями.
-- ⚡ **Infinite scroll** на фронте, async-индексация на бэке.
-- 🔒 **Полностью локально** — никаких внешних API, всё на твоём железе.
+- **Hybrid search** — FTS5 + BGE-M3 + CLIP, fused via RRF.
+- **OCR** through EasyOCR + PaddleOCR ensemble with CLAHE preprocessing for
+  stylized meme fonts.
+- **VLM captioning** via Ollama (`qwen3-vl-abliterated:8b-instruct`) — caption,
+  joke explanation, tags.
+- **CLIP** for meaning-based and image-to-image search.
+- **BGE-M3** (multilingual, dim=1024) for semantic search over OCR + VLM fields.
+- **Infinite scroll** on the frontend, async indexing on the backend.
+- **Fully local** — no cloud calls, everything runs on your machine.
 
 ## Stack
 
@@ -35,20 +35,20 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-При первом запуске скачаются ML-модели (~3 GB суммарно):
+On first launch the ML models will download (~3 GB total):
 - `clip-ViT-B-32-multilingual-v1` (~500 MB)
 - `clip-ViT-B-32` (~340 MB)
 - `BAAI/bge-m3` (~2.3 GB)
-- EasyOCR в `~/.EasyOCR/`, PaddleOCR в `~/.paddleocr/`
+- EasyOCR into `~/.EasyOCR/`, PaddleOCR into `~/.paddleocr/`
 
-### 2. Ollama (для VLM-описаний)
+### 2. Ollama (for VLM captions)
 
 ```bash
 ollama pull huihui_ai/qwen3-vl-abliterated:8b-instruct
 ollama serve
 ```
 
-Если Ollama не запущен — индексация пройдёт без VLM-полей (только OCR + CLIP).
+If Ollama isn't running, indexing proceeds without VLM fields (OCR + CLIP only).
 
 ### 3. Frontend
 
@@ -58,104 +58,106 @@ npm install
 npm run dev
 ```
 
-Фронт по адресу `http://localhost:5173`. Vite проксирует `/api` → `http://127.0.0.1:8000`.
+Frontend at `http://localhost:5173`. Vite proxies `/api` to `http://127.0.0.1:8000`.
 
-### 4. Загрузить мемы и проиндексировать
+### 4. Drop memes and index
 
-Закинь картинки (`.jpg` / `.jpeg` / `.png` / `.webp`) в папку `memes/`, открой
-фронт, нажми **«🚀 Начать индексацию из папки memes/»**. Можно следить за
-прогрессом — он стримится через `/api/stats`.
+Put images (`.jpg` / `.jpeg` / `.png` / `.webp`) into the `memes/` folder, open
+the frontend, and click **"Start indexing from memes/ folder"**. Progress is
+streamed via `/api/stats`.
 
-## Использование поиска
+## Search modes
 
-В верхней панели три режима:
+The top panel exposes three modes:
 
-| Режим | Что делает | Когда выбирать |
+| Mode | What it does | When to use |
 |---|---|---|
-| 🌟 **Гибридный** | FTS5 + BGE-M3 + CLIP, RRF-fusion | По умолчанию — лучший результат |
-| 📝 **По тексту** | FTS5 + BGE-M3 (без CLIP) | Когда уверен в формулировке |
-| 🧠 **По смыслу** | Только CLIP | Когда нужен чисто визуал |
+| **Hybrid** | FTS5 + BGE-M3 + CLIP, RRF fusion | Default — best out-of-the-box result |
+| **By text** | FTS5 + BGE-M3 (no CLIP) | When you trust the wording |
+| **By meaning** | CLIP only | When you want pure visual similarity |
 
-📷-кнопка справа от строки поиска — загрузить картинку для image-image поиска.
-Можно комбинировать с текстом: "найди мемы похожие на эту картинку и про котов".
+The camera button next to the search input loads an image for image-to-image
+search. It can be combined with text: "find memes similar to this image and
+about cats."
 
-## Архитектура
+## Architecture
 
-### Хранилища
+### Storage
 
-Каждый мем живёт в двух местах, синхронизация через `/api/index/resync`:
+Each meme lives in two stores; drift is healed by `/api/index/resync`:
 
 - **SQLite** (`memefinder.db`) — `memes` (filename, ocr_text, thumbnail_base64,
-  caption, humor_explain, tags, text_for_embedding) + `memes_fts` (FTS5 BM25
-  по `ocr_text`). Thread-local connections, WAL mode.
-- **ChromaDB** (`chroma_data/`) — две коллекции:
+  caption, humor_explain, tags, text_for_embedding) plus `memes_fts` (FTS5
+  BM25 over `ocr_text`). Thread-local connections, WAL mode.
+- **ChromaDB** (`chroma_data/`) — two collections:
   - `meme_embeddings` — CLIP image embeddings (dim=512, cosine).
-  - `text_embeddings` — BGE-M3 dense vectors (dim=1024, cosine) над
+  - `text_embeddings` — BGE-M3 dense vectors (dim=1024, cosine) over
     `text_for_embedding = OCR + caption + humor + tags`.
 
-### Pipeline индексации
+### Indexing pipeline
 
-Все CPU/GPU-операции — в `ThreadPoolExecutor(max_workers=1)`, чтобы не блокировать
-async-цикл и не ловить race-condition'ы на ML-моделях.
+All CPU/GPU work runs in a single-threaded `ThreadPoolExecutor` so it can't
+block the async loop or race on non-thread-safe ML models.
 
-Для каждого файла определяется состояние:
-1. В SQLite + обоих коллекциях ChromaDB → **skip**.
-2. В SQLite, не хватает CLIP/BGE-вектора → **embed-only** (быстрый путь).
-3. Новый → **full pipeline**:
-   - OCR (EasyOCR + PaddleOCR ансамбль с CV-препроцессингом)
-   - VLM (Ollama → JSON с `text`, `caption`, `humor`, `tags`)
-   - thumbnail (PIL → base64)
+For each file we determine its state:
+1. In SQLite + both ChromaDB collections -> **skip**.
+2. In SQLite, missing CLIP or BGE vector -> **embed-only** fast path.
+3. New -> **full pipeline**:
+   - OCR (EasyOCR + PaddleOCR ensemble with CV preprocessing)
+   - VLM (Ollama -> JSON with `text`, `caption`, `humor`, `tags`)
+   - thumbnail (PIL -> base64)
    - CLIP image embedding
    - BGE-M3 text embedding
-   - persist в SQLite + обе коллекции ChromaDB
+   - persist to SQLite + both ChromaDB collections
 
-### Гибридный поиск
+### Hybrid search
 
 `backend/search_service.py:hybrid_search()`:
 
-1. Параллельно (через executor) запускаются ретриверы:
-   - **FTS5** — top-60 по BM25 над `ocr_text`.
-   - **BGE-M3** — энкодим запрос → top-60 cosine-similarity в `text_embeddings`.
-   - **CLIP** — text→image (если только текст) или image→image (если загружена картинка) — top-40 в `meme_embeddings`.
-2. **Reciprocal Rank Fusion** объединяет ранги:
-   `score = Σ weight_l / (k1 + rank_l × k2)`, k1=60, k2=20.
-   Веса: BGE — 1.2 (самый сильный сигнал на ru/en), CLIP-text — 0.7, остальные — 1.0.
-3. Дедуп → пагинация → batch-fetch метаданных из SQLite.
-4. В ответе есть `timing_ms` каждого этапа — удобно тюнить.
+1. Retrievers run in parallel through the executor:
+   - **FTS5** — top-60 by BM25 over `ocr_text`.
+   - **BGE-M3** — encode the query, top-60 cosine in `text_embeddings`.
+   - **CLIP** — text->image (text-only query) or image->image (uploaded image),
+     top-40 in `meme_embeddings`.
+2. **Reciprocal Rank Fusion** combines ranks:
+   `score = sum_l(weight_l / (k1 + rank_l * k2))`, k1=60, k2=20.
+   Weights: BGE 1.2 (strongest single signal on ru/en), CLIP-text 0.7, others 1.0.
+3. Dedupe -> paginate -> batch-fetch metadata from SQLite.
+4. The response includes `timing_ms` per stage — handy for tuning.
 
-### VLM-описания
+### VLM captions
 
-Используется `qwen3-vl-abliterated:8b-instruct` через Ollama с `format="json"` для
-строгого JSON-ответа `{text, caption, humor, tags}`. На случай обрезки JSON или
-`temperature`-капризов модели:
-- **Один retry** с `temperature=0`, `num_predict=1024`.
-- **«Straggler-режим»** (`/api/index/vlm/stragglers`) — упрощённый prompt только
-  для `text` + `caption` с `num_predict=3072`. Для конспектов и сложных
-  скриншотов где модель не успевала уложиться в обычный prompt.
-- **Sentinel** `[авто: не удалось распознать]` для безнадёжных мемов
-  (4-6 штук на 4000), чтобы не пытаться снова при каждом прогоне.
+Uses `qwen3-vl-abliterated:8b-instruct` through Ollama with `format="json"` for
+strict-JSON output `{text, caption, humor, tags}`. To handle truncated JSON or
+temperature quirks:
+- **One retry** with `temperature=0`, `num_predict=1024`.
+- **Straggler mode** (`/api/index/vlm/stragglers`) — simplified prompt with
+  only `text` + `caption` and `num_predict=3072`. For dense study screenshots
+  and complex layouts that overflow the regular prompt's token budget.
+- **Sentinel** caption `[авто: не удалось распознать]` for genuinely
+  unrescuable memes (4-6 out of 4000), so they fall out of future queues.
 
 ## API
 
-| Endpoint | Описание |
+| Endpoint | Description |
 |---|---|
-| `GET /api/stats` | Статистика + прогресс всех фоновых задач |
+| `GET /api/stats` | Stats + progress for every background job |
 | `GET /api/search?q=...&mode=ocr\|clip&limit=&offset=` | Legacy single-retriever |
 | `POST /api/search` (multipart) | **Phase 3 hybrid** — `query`, `mode`, `image`, `limit`, `offset` |
-| `GET /api/image/original/{filename}` | Оригинал картинки из `memes/` |
-| `POST /api/index/start` | Полная индексация папки |
-| `POST /api/index/vlm` | VLM-backfill для мемов без caption |
-| `POST /api/index/vlm/stragglers` | Компактный prompt для «трудных» мемов |
-| `POST /api/index/text-embeddings` | Backfill BGE-M3 векторов |
-| `POST /api/index/reocr` | Re-OCR всех мемов (после смены `OCR_ENGINE` / `PREPROCESS`) |
-| `POST /api/index/resync` | Чистка drift между SQLite и ChromaDB |
+| `GET /api/image/original/{filename}` | Original image from `memes/` |
+| `POST /api/index/start` | Full folder indexing |
+| `POST /api/index/vlm` | VLM backfill for memes without a caption |
+| `POST /api/index/vlm/stragglers` | Compact-prompt rescue for hard memes |
+| `POST /api/index/text-embeddings` | Backfill BGE-M3 vectors |
+| `POST /api/index/reocr` | Re-OCR all memes (after changing `OCR_ENGINE` / `PREPROCESS`) |
+| `POST /api/index/resync` | Clean up drift between SQLite and ChromaDB |
 
-## Конфигурация
+## Configuration
 
-Всё в `backend/config.py`:
+Everything in `backend/config.py`:
 
 ```python
-# Модели
+# Models
 CLIP_TEXT_MODEL_NAME = "clip-ViT-B-32-multilingual-v1"
 CLIP_IMAGE_MODEL_NAME = "clip-ViT-B-32"
 TEXT_EMBED_MODEL_NAME = "BAAI/bge-m3"
@@ -175,45 +177,46 @@ RRF_K2 = 20.0
 RETRIEVER_TOP_K = 60
 IMAGE_RETRIEVER_TOP_K = 40
 
-# Прочее
+# Misc
 BATCH_SIZE = 16
 INDEX_LIMIT = 0           # 0 = no limit
-DEVICE = "cuda" если CUDA доступна, иначе "cpu"
+DEVICE = "cuda" if available, else "cpu"
 ```
 
-## Миграция со старой версии (Phase 1/2 → Phase 3)
+## Migrating from older versions (Phase 1/2 -> Phase 3)
 
-Если у тебя уже есть проиндексированная база со старой схемой:
+If you already have an indexed database on the older schema:
 
 ```bash
 cd backend
 python scripts/migrate_vlm_fields.py
 ```
 
-Скрипт идемпотентный — добавляет колонку `text_for_embedding` (если нужно),
-вычисляет её для всех строк и заливает BGE-векторы во вторую Chroma-коллекцию.
-Альтернатива — запустить бэкенд и дёрнуть `POST /api/index/text-embeddings`.
+The script is idempotent — it adds the `text_for_embedding` column (if missing),
+recomputes it for every row, and uploads BGE vectors into the new ChromaDB
+collection. Alternative: start the backend and call
+`POST /api/index/text-embeddings`.
 
-## Тесты
+## Tests
 
 ```bash
 cd backend
-pytest                        # всё (включая slow CLIP-тесты)
-pytest -m "not slow"          # без скачивания моделей — 55 тестов
-pytest tests/test_search.py   # только Phase 3
+pytest                        # all (including slow CLIP tests)
+pytest -m "not slow"          # 55 tests, no model downloads
+pytest tests/test_search.py   # Phase 3 only
 ```
 
-## Приватность
+## Privacy
 
-`.gitignore` закрывает `memes/`, `memefinder.db*`, `chroma_data/`, `*.log`, `.env`.
-БД хранит base64-миниатюры — **никогда** не коммить её. В git'е есть только
-тестовые `memes/meme1.jpg` и `memes/meme2.jpg` для smoke-тестов.
+`.gitignore` covers `memes/`, `memefinder.db*`, `chroma_data/`, `*.log`, `.env`.
+The database stores base64 thumbnails — **never** commit it. The repo only
+contains `memes/meme1.jpg` and `memes/meme2.jpg` for smoke tests.
 
-## Известные ограничения
+## Known limitations
 
-- VLM (8B abliterated) иногда (≈0.2%) залипает на repetition loop'ах с шакальными
-  шрифтами или схемами от руки — для них проставляется sentinel-метка.
-- BGE-M3 — самая тяжёлая модель (~2.3 GB), на CPU работает ~50 мс/запрос.
-  С CUDA ~5 мс.
-- Первая индексация большой коллекции (3000+ мемов) с VLM — 20-30 часов
-  на 8B-модели. Дальше при добавлении новых картинок — секунды на штуку.
+- The 8B abliterated VLM occasionally (~0.2%) gets stuck in a repetition loop
+  on stylized fonts or hand-drawn schemas — those memes get the sentinel caption.
+- BGE-M3 is the heaviest model (~2.3 GB); on CPU each query is ~50 ms, on CUDA
+  it drops to ~5 ms.
+- A first full index of a large library (3000+ memes) with VLM enabled takes
+  20-30 hours on the 8B model. Subsequent additions are seconds per image.
