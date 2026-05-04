@@ -61,6 +61,7 @@ export default function MemeModal({ meme, onClose }) {
   if (!meme) return null;
 
   const imgSrc = originalImageUrl(meme.filename);
+  const tags = Array.isArray(meme.tags) ? meme.tags : [];
 
   return (
     <div className="modal-backdrop" onClick={handleBackdropClick}>
@@ -80,14 +81,40 @@ export default function MemeModal({ meme, onClose }) {
         <img
           className="modal-image"
           src={imgSrc}
-          alt={meme.ocr_text || 'Мем'}
+          alt={meme.caption || meme.ocr_text || 'Мем'}
           onLoad={() => setImgLoaded(true)}
           style={{ display: imgLoaded ? 'block' : 'none' }}
         />
 
+        {meme.caption && (
+          <div className="modal-meta-block">
+            <div className="modal-meta-label">💬 Описание</div>
+            <div className="modal-meta-value">{meme.caption}</div>
+          </div>
+        )}
+
+        {meme.humor_explain && (
+          <div className="modal-meta-block">
+            <div className="modal-meta-label">😄 Юмор</div>
+            <div className="modal-meta-value">{meme.humor_explain}</div>
+          </div>
+        )}
+
         {meme.ocr_text && (
-          <div className="modal-ocr-text">
-            📝 {meme.ocr_text}
+          <div className="modal-meta-block">
+            <div className="modal-meta-label">📝 Текст на мема</div>
+            <div className="modal-meta-value">{meme.ocr_text}</div>
+          </div>
+        )}
+
+        {tags.length > 0 && (
+          <div className="modal-meta-block">
+            <div className="modal-meta-label">🏷️ Теги</div>
+            <div className="modal-tags">
+              {tags.map((t) => (
+                <span key={t} className="meme-tag">#{t}</span>
+              ))}
+            </div>
           </div>
         )}
 

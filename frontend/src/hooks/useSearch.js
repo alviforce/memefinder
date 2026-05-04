@@ -5,21 +5,25 @@ const API_BASE = '/api';
 /**
  * Hook for infinite-scroll meme search with pagination.
  * Loads PAGE_SIZE results at a time using offset.
+ *
+ * Phase 3: routes through POST /api/search (hybrid). Optionally accepts an
+ * image File; when present, the backend runs CLIP image→image search and
+ * fuses with the text retrievers via RRF.
  */
 const PAGE_SIZE = 30;
 
-export function useInfiniteSearch(query, mode, debounceMs = 400) {
+export function useInfiniteSearch(query, mode, imageFile, debounceMs = 400) {
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
   const [searched, setSearched] = useState(false);
   const [hasMore, setHasMore] = useState(false);
+  const [meta, setMeta] = useState({ retrievers: [], timing_ms: {}, fused_total: 0 });
   const abortRef = useRef(null);
   const offsetRef = useRef(0);
 
-  const doSearch = useCallback(async (q, m, offset = 0, append = false) => {
-    // Abort previous request
+  const doSearch = useCallback(async (q, m, file, offset = 0, append = false) => {
     if (abortRef.current) {
       abortRef.current.abort();
     }
@@ -34,11 +38,22 @@ export function useInfiniteSearch(query, mode, debounceMs = 400) {
     setError(null);
 
     try {
-      const res = await fetch(
-        `${API_BASE}/search?q=${encodeURIComponent(q)}&mode=${m}&limit=${PAGE_SIZE}&offset=${offset}`,
-        { signal: controller.signal }
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const form = new FormData();
+      if (q) form.append('query', q);
+      form.append('mode', m);
+      form.append('limit', String(PAGE_SIZE));
+      form.append('offset', String(offset));
+      if (file) form.append('image', file);
+
+      const res = await fetch(`${API_BASE}/search`, {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}${text ? `: ${text}` : ''}`);
+      }
       const data = await res.json();
       const items = data.results || [];
 
@@ -48,6 +63,11 @@ export function useInfiniteSearch(query, mode, debounceMs = 400) {
         setResults(items);
       }
 
+      setMeta({
+        retrievers: data.retrievers || [],
+        timing_ms: data.timing_ms || {},
+        fused_total: data.fused_total ?? items.length,
+      });
       setHasMore(items.length >= PAGE_SIZE);
       offsetRef.current = offset + items.length;
       setSearched(true);
@@ -62,32 +82,36 @@ export function useInfiniteSearch(query, mode, debounceMs = 400) {
     }
   }, []);
 
-  // Debounced search — reset on query/mode change
+  // Debounced search — reset on query/mode/image change
   useEffect(() => {
-    if (!query || query.trim().length === 0) {
+    const trimmed = (query || '').trim();
+    if (!trimmed && !imageFile) {
       setResults([]);
       setSearched(false);
       setError(null);
       setHasMore(false);
+      setMeta({ retrievers: [], timing_ms: {}, fused_total: 0 });
       offsetRef.current = 0;
       return;
     }
 
     const timer = setTimeout(() => {
       offsetRef.current = 0;
-      doSearch(query.trim(), mode, 0, false);
+      doSearch(trimmed, mode, imageFile, 0, false);
     }, debounceMs);
 
     return () => clearTimeout(timer);
-  }, [query, mode, debounceMs, doSearch]);
+  }, [query, mode, imageFile, debounceMs, doSearch]);
 
   // Load more (called by IntersectionObserver)
   const loadMore = useCallback(() => {
-    if (!query || loading || loadingMore || !hasMore) return;
-    doSearch(query.trim(), mode, offsetRef.current, true);
-  }, [query, mode, loading, loadingMore, hasMore, doSearch]);
+    const trimmed = (query || '').trim();
+    if (!trimmed && !imageFile) return;
+    if (loading || loadingMore || !hasMore) return;
+    doSearch(trimmed, mode, imageFile, offsetRef.current, true);
+  }, [query, mode, imageFile, loading, loadingMore, hasMore, doSearch]);
 
-  return { results, loading, loadingMore, error, searched, hasMore, loadMore };
+  return { results, loading, loadingMore, error, searched, hasMore, loadMore, meta };
 }
 
 /**
@@ -128,26 +152,22 @@ export async function copyImageToClipboard(filename) {
   const response = await fetch(url);
   const blob = await response.blob();
 
-  // Create an image element
   const img = document.createElement('img');
   img.crossOrigin = 'anonymous';
 
   return new Promise((resolve, reject) => {
     img.onload = async () => {
       try {
-        // Draw on canvas
         const canvas = document.createElement('canvas');
         canvas.width = img.naturalWidth;
         canvas.height = img.naturalHeight;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0);
 
-        // Convert to PNG blob
         const pngBlob = await new Promise(res =>
           canvas.toBlob(res, 'image/png')
         );
 
-        // Write to clipboard
         await navigator.clipboard.write([
           new ClipboardItem({ 'image/png': pngBlob }),
         ]);

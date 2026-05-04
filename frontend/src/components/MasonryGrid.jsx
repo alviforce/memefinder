@@ -1,7 +1,15 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect } from 'react';
 import MemeCard from './MemeCard';
 
-export default function MasonryGrid({ results, mode, onMemeClick, onLoadMore, hasMore, loadingMore }) {
+const MODE_LABEL = {
+  all:   '🌟 Гибрид',
+  text:  '📝 Текст',
+  image: '🧠 Смысл',
+  ocr:   '📝 OCR',
+  clip:  '🧠 CLIP',
+};
+
+export default function MasonryGrid({ results, mode, meta, onMemeClick, onLoadMore, hasMore, loadingMore }) {
   const sentinelRef = useRef(null);
 
   // IntersectionObserver for infinite scroll
@@ -23,21 +31,32 @@ export default function MasonryGrid({ results, mode, onMemeClick, onLoadMore, ha
 
   if (!results || results.length === 0) return null;
 
+  const totalLabel = meta?.fused_total
+    ? `${results.length} из ${meta.fused_total}${hasMore ? '' : ''}`
+    : `${results.length}${hasMore ? '+' : ''}`;
+  const timing = meta?.timing_ms?.total_ms;
+  const retrievers = meta?.retrievers || [];
+
   return (
     <>
       <div className="results-header">
         <span className="results-count">
-          Найдено: {results.length} мем{results.length === 1 ? '' : results.length < 5 ? 'а' : 'ов'}
-          {hasMore && '+'}
+          Найдено: {totalLabel}
+          {timing != null && (
+            <span className="results-timing"> · {Math.round(timing)} мс</span>
+          )}
         </span>
         <span>
-          Режим: {mode === 'clip' ? '🧠 CLIP' : '📝 OCR'}
+          Режим: {MODE_LABEL[mode] || mode}
+          {retrievers.length > 0 && (
+            <span className="results-retrievers"> · {retrievers.join(' + ')}</span>
+          )}
         </span>
       </div>
       <div className="masonry-grid">
         {results.map((meme, index) => (
           <MemeCard
-            key={`${meme.chat_id}_${meme.message_id}`}
+            key={meme.filename}
             meme={meme}
             mode={mode}
             index={index}

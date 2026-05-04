@@ -8,12 +8,17 @@ import { useInfiniteSearch, fetchStats } from './hooks/useSearch';
 
 export default function App() {
   const [query, setQuery] = useState('');
-  const [mode, setMode] = useState('clip');
+  const [mode, setMode] = useState('all');
+  const [imageFile, setImageFile] = useState(null);
   const [selectedMeme, setSelectedMeme] = useState(null);
-  const [stats, setStats] = useState({ meme_count: 0, embedding_count: 0 });
+  const [stats, setStats] = useState({
+    meme_count: 0,
+    embedding_count: 0,
+    text_embedding_count: 0,
+  });
 
-  const { results, loading, loadingMore, error, searched, hasMore, loadMore } =
-    useInfiniteSearch(query, mode);
+  const { results, loading, loadingMore, error, searched, hasMore, loadMore, meta } =
+    useInfiniteSearch(query, mode, imageFile);
 
   // Load stats
   const loadStats = useCallback(async () => {
@@ -38,7 +43,7 @@ export default function App() {
       {/* Header */}
       <header className="app-header">
         <h1 className="app-logo">MemeFinder</h1>
-        <p className="app-subtitle">Умный поиск мемов из Telegram</p>
+        <p className="app-subtitle">Гибридный поиск мемов: OCR + BGE-M3 + CLIP</p>
       </header>
 
       {/* Search */}
@@ -47,15 +52,20 @@ export default function App() {
         onQueryChange={setQuery}
         mode={mode}
         onModeChange={setMode}
+        imageFile={imageFile}
+        onImageChange={setImageFile}
       />
 
       {/* Stats */}
       <div className="stats-bar">
         <div className="stat-item">
-          🖼️ <span className="stat-value">{stats.meme_count}</span> мемов проиндексировано
+          🖼️ <span className="stat-value">{stats.meme_count}</span> мемов
         </div>
         <div className="stat-item">
-          🧠 <span className="stat-value">{stats.embedding_count}</span> эмбеддингов
+          🧠 <span className="stat-value">{stats.embedding_count}</span> CLIP
+        </div>
+        <div className="stat-item">
+          📚 <span className="stat-value">{stats.text_embedding_count ?? 0}</span> BGE
         </div>
       </div>
 
@@ -89,6 +99,7 @@ export default function App() {
         <MasonryGrid
           results={results}
           mode={mode}
+          meta={meta}
           onMemeClick={setSelectedMeme}
           onLoadMore={loadMore}
           hasMore={hasMore}

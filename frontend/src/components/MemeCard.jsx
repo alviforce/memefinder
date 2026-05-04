@@ -13,7 +13,6 @@ export default function MemeCard({ meme, mode, index, onClick }) {
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
       console.error('Copy failed:', err);
-      // Fallback: copy the proxy URL
       try {
         const url = window.location.origin + originalImageUrl(meme.filename);
         await navigator.clipboard.writeText(url);
@@ -25,6 +24,9 @@ export default function MemeCard({ meme, mode, index, onClick }) {
     }
   }, [meme.filename]);
 
+  const tags = Array.isArray(meme.tags) ? meme.tags : [];
+  const caption = (meme.caption || '').trim();
+
   return (
     <div
       className="meme-card"
@@ -34,7 +36,7 @@ export default function MemeCard({ meme, mode, index, onClick }) {
       {/* Score badge */}
       {meme.score != null && (
         <span className="meme-card-score">
-          {Math.round(meme.score * 100)}%
+          {meme.score < 1 ? Math.round(meme.score * 100) + '%' : meme.score.toFixed(2)}
         </span>
       )}
 
@@ -42,7 +44,7 @@ export default function MemeCard({ meme, mode, index, onClick }) {
       <img
         className="meme-card-image"
         src={meme.thumbnail_base64}
-        alt={meme.ocr_text || 'Мем'}
+        alt={caption || meme.ocr_text || 'Мем'}
         loading="lazy"
         onLoad={() => setLoaded(true)}
         style={{ opacity: loaded ? 1 : 0, transition: 'opacity 0.3s ease' }}
@@ -50,8 +52,20 @@ export default function MemeCard({ meme, mode, index, onClick }) {
 
       {/* Hover overlay */}
       <div className="meme-card-overlay">
-        {mode === 'ocr' && meme.ocr_text && (
+        {caption && (
+          <div className="meme-card-caption" title={caption}>
+            💬 {caption}
+          </div>
+        )}
+        {!caption && mode === 'text' && meme.ocr_text && (
           <div className="meme-card-text">{meme.ocr_text}</div>
+        )}
+        {tags.length > 0 && (
+          <div className="meme-card-tags">
+            {tags.slice(0, 5).map((t) => (
+              <span key={t} className="meme-tag">#{t}</span>
+            ))}
+          </div>
         )}
         <div className="meme-card-actions">
           <button

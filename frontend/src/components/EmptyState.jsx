@@ -1,3 +1,11 @@
+const MODE_NAME = {
+  all: 'Гибридном',
+  text: 'Текстовом',
+  image: 'Смысловом',
+  ocr: 'OCR',
+  clip: 'CLIP',
+};
+
 export default function EmptyState({ searched, query, mode }) {
   // No search yet
   if (!searched) {
@@ -6,9 +14,10 @@ export default function EmptyState({ searched, query, mode }) {
         <div className="empty-icon">🔎</div>
         <h2 className="empty-title">Найди свой мем</h2>
         <p className="empty-description">
-          Введите запрос в строку поиска.
-          Используйте режим <strong>CLIP</strong> для поиска по смыслу
-          или <strong>OCR</strong> для поиска по надписям.
+          Введите запрос или загрузите картинку.
+          <br />
+          Режим <strong>🌟 Гибрид</strong> объединяет OCR, BGE-M3 и CLIP через RRF —
+          лучший результат «из коробки».
         </p>
       </div>
     );
@@ -20,8 +29,8 @@ export default function EmptyState({ searched, query, mode }) {
       <div className="empty-icon">😕</div>
       <h2 className="empty-title">Ничего не найдено</h2>
       <p className="empty-description">
-        По запросу «{query}» в режиме {mode === 'clip' ? 'CLIP' : 'OCR'} ничего не нашлось.
-        Попробуйте переформулировать запрос или переключить режим поиска.
+        По запросу «{query}» в {MODE_NAME[mode] || mode} режиме ничего не нашлось.
+        Попробуйте переформулировать запрос или переключить режим.
       </p>
     </div>
   );
